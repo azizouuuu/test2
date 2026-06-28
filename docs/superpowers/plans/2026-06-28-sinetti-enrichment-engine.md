@@ -225,6 +225,11 @@ def test_endpoints_and_policy_present():
     assert cfg.TTL_OK["VIES"] == 30 and cfg.TTL_OK["GLEIF"] == 90
     assert 0.0 < cfg.ABSTAIN_THRESHOLD <= 1.0
     assert cfg.KEY_VERSION  # non-empty; bumping invalidates caches
+
+def test_reconciliation_thresholds_present():
+    # Reconciliation boundaries are their OWN constants, decoupled from the GLEIF abstain cutoff
+    # (the spike retunes ABSTAIN_THRESHOLD only; these stay put unless deliberately changed).
+    assert cfg.NAME_PARTIAL_THRESHOLD < cfg.NAME_MATCH_THRESHOLD <= 1.0
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -246,7 +251,13 @@ TIMEOUTS = (5, 10)                 # (connect, read) seconds
 RETRY_BACKOFF_S = 1.5              # one retry on 429/timeout, then 'unavailable'
 MAX_CALLS_PER_SESSION = 200        # hard cap, defensive
 
-ABSTAIN_THRESHOLD = 0.85           # GLEIF score < this => no_match. Tuned by the spike (Task 0).
+ABSTAIN_THRESHOLD = 0.85           # GLEIF score < this => no_match. Tuned by the spike (Phase 0).
+
+# Registry-name reconciliation boundaries — SEPARATE from ABSTAIN_THRESHOLD on purpose. The spike
+# retunes ABSTAIN_THRESHOLD (GLEIF candidate selection); these govern verdict name-matching and
+# should be changed only deliberately.
+NAME_MATCH_THRESHOLD = 0.85        # >= this => "match"
+NAME_PARTIAL_THRESHOLD = 0.60      # >= this (and < match) => "partial"; below => "mismatch"
 
 TTL_OK = {"VIES": 30, "GLEIF": 90}  # days for a confirmed result
 TTL_NO_MATCH = 7                    # days for a no_match (absences don't outlive data refreshes)
@@ -307,6 +318,11 @@ def test_unrelated_name_scores_low():
     s = score({"name": "Globex Petroleum AG", "country": "IT", "postcode": "", "address": ""},
               _inp("VENANZIEFFE SRL"))
     assert s < 0.5
+
+def test_name_similarity_is_pure_name_only():
+    from enrich.matching import name_similarity
+    assert name_similarity("Venanzieffe S.R.L.", "VENANZIEFFE srl") >= 0.95
+    assert name_similarity("Globex Petroleum AG", "Venanzieffe SRL") < 0.5
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -341,6 +357,12 @@ def normalise(name: str) -> str:
 
 def _token_ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
+
+
+def name_similarity(a: str, b: str) -> float:
+    """0..1 similarity of two company names, NAME ONLY (normalised). Used by registry-name
+    reconciliation, where geo bonuses would be tautological (both sides share the cert's geo)."""
+    return _token_ratio(normalise(a), normalise(b))
 
 
 def score(cand: dict, inp: "CompanyInput") -> float:
@@ -428,6 +450,27 @@ def test_ins_anonymised_placeholder_and_foreign_vat_guard():
     assert ci.anonymised is True
     assert ci.vat is None          # foreign-prefixed / empty country => not VIES-usable
     assert ci.cert_status == "unknown"
+
+def test_ins_it_country_with_foreign_prefixed_vat_is_rejected():
+    # country IS 'IT' so we reach the 11-digit regex guard (not short-circuited by the country check).
+    row = {"certificate_id": "x", "holder_name": "PROVALT JURA SNC", "holder_norm": "provaltjura",
+           "country": "IT", "partita_iva": "FR 71449427145", "codice_fiscale": "", "status": "active"}
+    ci = from_sinetti_record(row, "INS")
+    assert ci.vat is None          # 'FR 71449427145' is not 11 digits => rejected by the regex
+
+def test_ins_pdf_join_strips_nondigits_in_key():
+    # The real index keys on digits-only tax codes; a spaced/prefixed value must still resolve.
+    row = {"certificate_id": "x", "holder_name": "ACME SRL", "holder_norm": "acmesrl",
+           "country": "IT", "partita_iva": " 100 022 90152 ", "codice_fiscale": "", "status": "active"}
+    idx = {"piva:10002290152": {"status": "withdrawn"}}
+    ci = from_sinetti_record(row, "INS", ins_pdf_index=idx)
+    assert ci.cert_status == "withdrawn"
+
+def test_iscc_compliance_merged_status_wins():
+    row = {"certificate_id": "EU-ISCC-Cert-x", "holder_name": "SOFIWAGA, Lieoux, France",
+           "holder_norm": "sofiwaga", "country": "FR", "raw_status": "1", "status": "withdrawn"}
+    ci = from_sinetti_record(row, "ISCC")
+    assert ci.cert_status == "withdrawn"   # merged compliance status beats raw_status '1'
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -481,8 +524,15 @@ def from_sinetti_record(row: dict, scheme: str, *, ins_pdf_index: dict | None = 
     if scheme == "ISCC":
         name = iscc._company_name(holder)
         address = iscc._address_part(holder) or None
-        status = "suspended" if row.get("suspended_date") else _ISCC_STATUS.get(
-            str(row.get("raw_status", "")).strip(), "unknown")
+        # The verifier feeds compliance-MERGED rows (iscc._all_scheme_certs), so withdrawn/suspended
+        # arrive as an explicit `status`. Prefer it; fall back to suspended_date, then raw_status.
+        merged = (row.get("status") or "").lower()
+        if merged in ("withdrawn", "suspended", "revoked"):
+            status = _REDCERT_STATUS.get(merged, merged)
+        elif row.get("suspended_date"):
+            status = "suspended"
+        else:
+            status = _ISCC_STATUS.get(str(row.get("raw_status", "")).strip(), "unknown")
         return CompanyInput(scheme, cert_id, name, norm, country, address, None, None,
                             None, status, False)
 
@@ -496,8 +546,11 @@ def from_sinetti_record(row: dict, scheme: str, *, ins_pdf_index: dict | None = 
         vat = _clean_vat(row.get("partita_iva", ""), row.get("codice_fiscale", ""), country)
         status = "unknown"
         if ins_pdf_index:
-            for key in (f"piva:{row.get('partita_iva','')}", f"cf:{row.get('codice_fiscale','')}",
-                        f"name:{norm}"):
+            # ins.build_cert_pdf_index keys on DIGITS-ONLY tax codes (cf:/piva:) + name:_holder_norm.
+            # Strip non-digits so a foreign-prefixed/spaced VAT still resolves (verified vs ins.py).
+            piva_d = re.sub(r"\D", "", row.get("partita_iva", "") or "")
+            cf_d = re.sub(r"\D", "", row.get("codice_fiscale", "") or "")
+            for key in (f"piva:{piva_d}", f"cf:{cf_d}", f"name:{norm}"):
                 hit = ins_pdf_index.get(key)
                 if hit and hit.get("status"):
                     status = _REDCERT_STATUS.get(hit["status"].lower(), hit["status"].lower())
@@ -534,6 +587,8 @@ git commit -m "feat(enrich): add per-scheme Sinetti->CompanyInput adapter"
 **Interfaces:**
 - Consumes: `CompanyInput`, `Field`, `ProviderResult` (Task 1); the `ScreeningSource` protocol (this task).
 - Produces: `ScreeningSource` + `CacheStore` protocols; `fraud_lookup(inp, screening) -> ProviderResult`; `IsccScreening` class (Sinetti-side, wraps `iscc.blocklist_match`).
+
+**Note on the two ISCC integrity sources (spec §7.3):** the exact-name **blocklist** (630 fake/excluded) is screened here via `ScreeningSource.blocklist_hits`. The **compliance overlay** (677 suspended/withdrawn) is *not* a separate port call — it is delivered through `cert_status`, because the adapter (Task 4) reads the compliance-merged `status` on ISCC rows. So a withdrawn/suspended holder drives the verdict via `cert_status`, and the blocklist drives `on_fraud_list`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -656,7 +711,7 @@ git commit -m "feat(enrich): add ports + offline fraud screen via screening port
 - Consumes: `config.TTL_*`, `config.KEY_VERSION` (Task 2).
 - Produces: `SqliteCacheStore` (implements `CacheStore`); `record_enrichment(holder_norm, scheme, verdict_level, reasons)`; `make_cache_store()` factory (returns the SQLite store locally, Snowflake store in SiS).
 
-**Note:** the Snowflake mirror (`SnowflakeCacheStore`) mirrors the API but is validated in-account separately, exactly like `store_iscc_snowflake.py`. v1 runs on Hugging Face (SQLite). Include the class with the same method signatures and a `# validated in-account` marker; do not block v1 on it.
+**Note:** the Snowflake mirror (`SnowflakeCacheStore`) follows the same in-account-validation discipline as `store_iscc_snowflake.py` (which mirrors the persistence API as **module-level functions**, not a class — so there is no existing cache template to inherit; we define our own class with the `CacheStore` method signatures). v1 runs on Hugging Face (SQLite), so this class is not exercised in CI; include it with a `# validated in-account` marker and do not block v1 on it. **If the SiS path is ever exercised, the `enrichment_cache`/`enrichment_history` tables must also be created in the Snowflake account** (this plan only wires `init_enrich_tables()` into the SQLite `store_iscc.init_iscc_tables()`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -677,7 +732,7 @@ def test_expired_entry_returns_none(tmp_path, monkeypatch):
     monkeypatch.setattr(enrich_store, "DB_PATH", tmp_path / "t.db")
     enrich_store.init_enrich_tables()
     store = enrich_store.SqliteCacheStore()
-    store.put("GLEIF", "k2", "no_match", {}, ttl_days=0)   # already expired
+    store.put("GLEIF", "k2", "no_match", {}, ttl_days=-1)  # expires_at strictly in the past
     assert store.get("GLEIF", "k2") is None
 
 def test_record_enrichment_history(tmp_path, monkeypatch):
@@ -686,6 +741,7 @@ def test_record_enrichment_history(tmp_path, monkeypatch):
     enrich_store.record_enrichment("acmesrl", "INS", "verified", ["VAT valid (VIES)"])
     rows = enrich_store.recent_enrichments(limit=5)
     assert rows and rows[0]["holder_norm"] == "acmesrl" and rows[0]["verdict_level"] == "verified"
+    assert rows[0]["reasons"] == ["VAT valid (VIES)"]   # decoded to a list, mirrors the write param
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -767,7 +823,12 @@ def recent_enrichments(limit: int = 20) -> list[dict]:
         rows = c.execute("SELECT holder_norm, scheme, verdict_level, reasons_json, produced_at, "
                          "produced_by FROM enrichment_history ORDER BY id DESC LIMIT ?",
                          (limit,)).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["reasons"] = json.loads(d.pop("reasons_json") or "[]")   # decode; read shape mirrors write
+        out.append(d)
+    return out
 
 
 def make_cache_store():
@@ -882,21 +943,66 @@ def test_transport_error_is_unavailable():
     assert r.status == "unavailable"
 ```
 
+```python
+# tests/test_enrich_http.py  (the §10 retry + cap policy)
+import pytest
+from enrich.providers import base
+from enrich import config
+
+def test_retries_once_on_429(monkeypatch):
+    monkeypatch.setattr(base.time, "sleep", lambda s: None)   # no real backoff in tests
+    base.reset_session_calls()
+    calls = {"n": 0}
+    def flaky(url):
+        calls["n"] += 1
+        return (429, {}) if calls["n"] == 1 else (200, {"ok": True})
+    got = base.with_policy(flaky)("http://x")
+    assert got == (200, {"ok": True}) and calls["n"] == 2
+
+def test_retries_once_on_transport_error(monkeypatch):
+    monkeypatch.setattr(base.time, "sleep", lambda s: None)
+    base.reset_session_calls()
+    calls = {"n": 0}
+    def flaky(url):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("blip")
+        return (200, {"ok": True})
+    assert base.with_policy(flaky)("http://x") == (200, {"ok": True})
+
+def test_session_cap_raises(monkeypatch):
+    monkeypatch.setattr(config, "MAX_CALLS_PER_SESSION", 2)
+    base.reset_session_calls()
+    g = base.with_policy(lambda url: (200, {}))
+    g("http://x"); g("http://x")
+    with pytest.raises(RuntimeError):
+        g("http://x")
+```
+
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_enrich_vies.py -q`
+Run: `python -m pytest tests/test_enrich_vies.py tests/test_enrich_http.py -q`
 Expected: FAIL with `ModuleNotFoundError`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
 # enrich/providers/base.py
-"""Default HTTP GET returning (status_code, parsed_json). Stdlib only (urllib) so there is no new
-dependency and it works in the SiS-free Hugging Face runtime. Tests inject a fake instead."""
+"""Default HTTP GET returning (status_code, parsed_json), plus a policy wrapper implementing the
+spec §10 retry + per-session call cap. Stdlib only (urllib) so there is no new dependency and it
+works in the SiS-free Hugging Face runtime. Tests inject a fake http_get (bypassing the policy)."""
 from __future__ import annotations
 import json
+import time
 import urllib.request
 from enrich import config
+
+_session_calls = 0
+
+
+def reset_session_calls() -> None:
+    global _session_calls
+    _session_calls = 0
 
 
 def default_http_get(url: str) -> tuple[int, dict]:
@@ -905,6 +1011,28 @@ def default_http_get(url: str) -> tuple[int, dict]:
     with urllib.request.urlopen(req, timeout=config.TIMEOUTS[1]) as resp:
         body = resp.read().decode("utf-8", "replace")
         return resp.status, (json.loads(body) if body else {})
+
+
+def with_policy(http_get):
+    """Wrap an http_get with a hard per-session call cap (MAX_CALLS_PER_SESSION) and ONE retry on
+    HTTP 429 or a transport error, after RETRY_BACKOFF_S. The engine applies this to the default
+    (production) http_get only; injected test fakes bypass it. A cap hit / repeated failure raises,
+    which each provider's own try/except turns into status='unavailable'."""
+    def wrapped(url):
+        global _session_calls
+        if _session_calls >= config.MAX_CALLS_PER_SESSION:
+            raise RuntimeError("enrichment call cap reached")
+        _session_calls += 1
+        try:
+            code, body = http_get(url)
+        except Exception:
+            time.sleep(config.RETRY_BACKOFF_S)
+            return http_get(url)          # one retry; a second failure propagates -> unavailable
+        if code == 429:
+            time.sleep(config.RETRY_BACKOFF_S)
+            return http_get(url)
+        return code, body
+    return wrapped
 ```
 
 ```python
@@ -949,14 +1077,14 @@ def vies_lookup(inp: CompanyInput, *, http_get) -> ProviderResult:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python -m pytest tests/test_enrich_vies.py -q`
-Expected: PASS (5 passed).
+Run: `python -m pytest tests/test_enrich_vies.py tests/test_enrich_http.py -q`
+Expected: PASS (5 + 3 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add enrich/providers/base.py enrich/providers/vies.py tests/test_enrich_vies.py
-git commit -m "feat(enrich): add VIES VAT-validation provider (userError-aware)"
+git add enrich/providers/base.py enrich/providers/vies.py tests/test_enrich_vies.py tests/test_enrich_http.py
+git commit -m "feat(enrich): add VIES provider (userError-aware) + retry/cap http policy"
 ```
 
 ---
@@ -971,7 +1099,7 @@ git commit -m "feat(enrich): add VIES VAT-validation provider (userError-aware)"
 - Consumes: `CompanyInput`, `Field`, `ProviderResult` (Task 1); `matching.score` (Task 3); `config.GLEIF_BASE`.
 - Produces: `gleif_lookup(inp, *, http_get, abstain_threshold) -> ProviderResult`.
 
-**Discovery algorithm (fixed):** structured filter first; if zero candidates, fall back to `fuzzycompletions`; union+dedupe by LEI; score; best ≥ threshold or `no_match`. `http_get` is called per-URL; the test fake dispatches on URL substring.
+**Discovery algorithm (fixed):** structured filter first; **if it returns zero candidates, fall back** to `fuzzycompletions`; de-dupe by LEI; score; best ≥ threshold or `no_match`. (Fewer calls = kinder to GLEIF rate limits than always querying both.) `http_get` is called per-URL; the test fake dispatches on URL substring.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1106,9 +1234,14 @@ def gleif_lookup(inp: CompanyInput, *, http_get, abstain_threshold: float) -> Pr
             "lei": Field(best["lei"], "GLEIF", best_score, today),
             "registered_name": Field((ent.get("legalName") or {}).get("name", best["name"]),
                                      "GLEIF", best_score, today),
-            "national_reg": Field(ent.get("registeredAs"), "GLEIF", best_score, today),
-            "registry": Field(reg_at.get("id") or reg_at.get("other"), "GLEIF", best_score, today),
         }
+        # Only surface truthy values, so identity never carries None-valued Fields (mirrors VIES).
+        nat = ent.get("registeredAs")
+        if nat:
+            fields["national_reg"] = Field(nat, "GLEIF", best_score, today)
+        ra = reg_at.get("id") or reg_at.get("other")   # raw RA code; resolving it to a name is v1.1
+        if ra:
+            fields["registry"] = Field(ra, "GLEIF", best_score, today)
         return ProviderResult("GLEIF", "ok", fields, redistributable=True)
     except Exception:
         return ProviderResult("GLEIF", "unavailable", {}, redistributable=True)
@@ -1204,15 +1337,36 @@ def test_vies_invalid_name_unconfirmable_is_caution():
                 ins_pdf_index={"piva:10002290152": {"status": "valid"}})
     assert p.verdict.level == "caution"
 
-def test_cache_roundtrip_uses_same_key():
+def test_cache_serves_second_run_without_refetching():
     cache = MemCache()
-    args = dict(external_allowed=True, cache=cache, screening=Screen(),
-                http_get=_http({"/vat/": VIES_OK, "lei-records": {"data": []}, "fuzzycompletions": {"data": []}}),
+    calls = {"n": 0}
+    backing = _http({"/vat/": VIES_OK, "lei-records": {"data": []}, "fuzzycompletions": {"data": []}})
+    def counting(url):
+        calls["n"] += 1
+        return backing(url)
+    args = dict(external_allowed=True, cache=cache, screening=Screen(), http_get=counting,
                 ins_pdf_index={"piva:10002290152": {"status": "valid"}})
-    profile(INS_ROW, "INS", **args)
-    keys_after_first = set(cache.d.keys())
-    profile(INS_ROW, "INS", **args)
-    assert set(cache.d.keys()) == keys_after_first   # no key drift -> reused, not duplicated
+    p1 = profile(INS_ROW, "INS", **args)
+    first = calls["n"]
+    assert first > 0
+    p2 = profile(INS_ROW, "INS", **args)
+    assert calls["n"] == first              # 2nd run served from cache: ZERO new HTTP calls
+    assert p2.verdict.level == p1.verdict.level == "verified"   # rehydrated payload is usable
+
+def test_vat_resolves_to_different_company_is_caution():
+    # VIES validates the VAT but it belongs to a DIFFERENT company; GLEIF matches the cert name.
+    vies_other = {"isValid": True, "userError": "VALID", "name": "GLOBEX PETROLEUM AG", "address": "X"}
+    glist = {"data": [{"id": "984500ZZ", "attributes": {"entity": {
+        "legalName": {"name": "VENANZIEFFE SRL"}, "legalAddress": {"country": "IT", "postalCode": "00197"}}}}],
+        "meta": {"pagination": {"total": 1}}}
+    grec = {"data": {"id": "984500ZZ", "attributes": {"entity": {
+        "legalName": {"name": "VENANZIEFFE SRL"}, "legalAddress": {"country": "IT"},
+        "registeredAs": "RM-1", "registeredAt": {"id": "RA000407"}}}}}
+    http = _http({"/vat/": vies_other, "filter[entity.legalName]": glist, "/lei-records/": grec,
+                  "fuzzycompletions": {"data": []}})
+    p = profile(INS_ROW, "INS", external_allowed=True, cache=MemCache(), screening=Screen(),
+                http_get=http, ins_pdf_index={"piva:10002290152": {"status": "valid"}})
+    assert p.verdict.level == "caution"   # name mismatch + sources disagree both route here
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1247,9 +1401,12 @@ def _cached_or_call(provider: str, inp: CompanyInput, cache, call):
     hit = cache.get(provider, key)
     if hit is not None:
         from enrich.models import Field
-        fields = {k: Field(**v) for k, v in hit["payload"].items()}
-        red = provider != "VIES"
-        return ProviderResult(provider, hit["status"], fields, red), True
+        try:
+            allowed = ("value", "source", "confidence", "as_of")
+            fields = {k: Field(**{a: v[a] for a in allowed}) for k, v in hit["payload"].items()}
+            return ProviderResult(provider, hit["status"], fields, provider != "VIES"), True
+        except Exception:
+            pass   # malformed / older-shape cache row -> treat as a miss and re-fetch
     res = call()
     if res.status in ("ok", "no_match"):
         ttl = config.TTL_NO_MATCH if res.status == "no_match" else config.TTL_OK.get(provider, 30)
@@ -1259,17 +1416,30 @@ def _cached_or_call(provider: str, inp: CompanyInput, cache, call):
 
 
 def _reconcile(inp: CompanyInput, vies: ProviderResult, gleif: ProviderResult) -> NameMatch:
+    """Compare the resolved registered NAME (VIES preferred, else GLEIF) to the certificate name.
+    NAME ONLY — feeding the cert's own geo into score() would self-agree and inflate the match,
+    masking the very 'VAT resolves to a different company' fraud signal this check exists for."""
     for src in (vies, gleif):
         f = src.fields.get("registered_name")
         if f and f.value:
-            s = matching.score({"name": str(f.value), "country": inp.country,
-                                "postcode": inp.postcode, "address": inp.address}, inp)
-            level = "match" if s >= 0.85 else "partial" if s >= 0.6 else "mismatch"
+            s = matching.name_similarity(str(f.value), inp.name)
+            level = ("match" if s >= config.NAME_MATCH_THRESHOLD
+                     else "partial" if s >= config.NAME_PARTIAL_THRESHOLD else "mismatch")
             return NameMatch(level, round(s, 3), src.provider)
     return NameMatch("n/a", 0.0, "")
 
 
-def _verdict(inp, fraud, vies, gleif, nm: NameMatch) -> Verdict:
+def _sources_disagree(vies: ProviderResult, gleif: ProviderResult) -> bool:
+    """True when BOTH VIES and GLEIF returned a registered name and the two authorities name
+    different entities (similarity below the partial threshold) — a due-diligence red flag."""
+    v = vies.fields.get("registered_name")
+    g = gleif.fields.get("registered_name")
+    if v and v.value and g and g.value:
+        return matching.name_similarity(str(v.value), str(g.value)) < config.NAME_PARTIAL_THRESHOLD
+    return False
+
+
+def _verdict(inp, fraud, vies, gleif, nm: NameMatch, sources_disagree: bool) -> Verdict:
     on_list = fraud.fields["on_fraud_list"].value
     cert = inp.cert_status
     r = []
@@ -1286,6 +1456,8 @@ def _verdict(inp, fraud, vies, gleif, nm: NameMatch) -> Verdict:
         r.append("Certificate expired (ISCC-lists)")
     if nm.level == "mismatch":
         r.append(f"Registry name does not match the certificate ({nm.compared_to})")
+    if sources_disagree:
+        r.append("VIES and GLEIF resolve to different company names")
     if r:
         return Verdict("caution", r)
 
@@ -1299,15 +1471,26 @@ def _verdict(inp, fraud, vies, gleif, nm: NameMatch) -> Verdict:
             r.append(f"Registry name matches the certificate ({nm.level})")
         return Verdict("verified", r)
 
-    return Verdict("insufficient_data",
-                   ["No fraud signal, but no positive external confirmation available "
-                    f"(cert status: {cert})"])
+    # insufficient_data — build the reason from what actually happened. Do NOT claim "no positive
+    # confirmation" when a provider DID confirm something but cert_status (often 'unknown' for INS)
+    # blocks 'verified'.
+    confirmed = []
+    if vies.status == "ok":
+        confirmed.append("VAT valid (VIES)")
+    if gleif.status == "ok":
+        confirmed.append("identity matched in GLEIF")
+    if confirmed:
+        reasons = [", ".join(confirmed) + f", but certificate status is '{cert}' — not enough to fully confirm"]
+    else:
+        reasons = [f"No fraud signal, but no positive external confirmation available (cert status: {cert})"]
+    return Verdict("insufficient_data", reasons)
 
 
 def profile(row, scheme, *, external_allowed, cache, screening, http_get=None, ins_pdf_index=None):
     if http_get is None:
-        from enrich.providers.base import default_http_get
-        http_get = default_http_get
+        # Production path: wrap the real GET with the §10 retry + per-session cap policy.
+        from enrich.providers import base
+        http_get = base.with_policy(base.default_http_get)
     inp = adapter.from_sinetti_record(row, scheme, ins_pdf_index=ins_pdf_index)
 
     fraud = fraud_lookup(inp, screening)
@@ -1321,7 +1504,7 @@ def profile(row, scheme, *, external_allowed, cache, screening, http_get=None, i
         gleif = ProviderResult("GLEIF", "unavailable", {}, redistributable=True)
 
     nm = _reconcile(inp, vies, gleif)
-    verdict = _verdict(inp, fraud, vies, gleif, nm)
+    verdict = _verdict(inp, fraud, vies, gleif, nm, _sources_disagree(vies, gleif))
 
     identity = {}
     for src in (vies, gleif):
@@ -1337,13 +1520,13 @@ def profile(row, scheme, *, external_allowed, cache, screening, http_get=None, i
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_enrich_engine.py -q`
-Expected: PASS (6 passed).
+Expected: PASS (7 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add enrich/engine.py tests/test_enrich_engine.py
-git commit -m "feat(enrich): add engine orchestration, reconciliation, 4-state verdict"
+git commit -m "feat(enrich): add engine orchestration, name reconciliation, 4-state verdict"
 ```
 
 ---
@@ -1477,7 +1660,10 @@ In `iscc.py`, inside `render_global_verify()` — within the `with col:` block, 
             if st.button(":material/policy: Run due-diligence profile", key=f"dd_run_{scheme}",
                          use_container_width=True):
                 norm = options[picked]
-                row = next(c for c in matches if c.get("holder_norm") == norm)
+                # When a holder has several certs, profile the MOST RECENT (drives cert_status).
+                holder_certs = sorted([c for c in matches if c.get("holder_norm") == norm],
+                                      key=lambda c: c.get("valid_until") or "", reverse=True)
+                row = holder_certs[0]
                 import enrichment_ui
                 st.session_state[f"dd_profile_{scheme}"] = enrichment_ui.run_profile(row, scheme)
             prof = st.session_state.get(f"dd_profile_{scheme}")
@@ -1552,6 +1738,36 @@ def test_gleif_cassette_full_chain_resolves_identity():
         return (200, json.loads((FX / "gleif_list_hit.json").read_text()))
     r = gleif_lookup(_inp(), http_get=http, abstain_threshold=0.85)
     assert r.status == "ok" and r.fields["national_reg"].value
+
+def test_engine_caches_through_real_sqlite_store(tmp_path, monkeypatch):
+    # Pins the vars(Field) -> json.dumps -> json.loads -> Field(**v) round-trip through the REAL
+    # JSON-backed store (the in-memory MemCache in Task 9 can't catch JSON coercion).
+    import enrich_store
+    from enrich import engine
+    monkeypatch.setattr(enrich_store, "DB_PATH", tmp_path / "c.db")
+    enrich_store.init_enrich_tables()
+    store = enrich_store.SqliteCacheStore()
+
+    class Screen:
+        def blocklist_hits(self, name): return []
+
+    calls = {"n": 0}
+    def http(url):
+        calls["n"] += 1
+        if "/vat/" in url:
+            return (200, json.loads((FX / "vies_valid.json").read_text()))
+        return (200, {"data": [], "meta": {"pagination": {"total": 0}}})   # GLEIF no_match
+
+    row = {"certificate_id": "10002290152", "holder_name": "VENANZIEFFE SRL",
+           "holder_norm": "venanzieffe", "country": "IT", "partita_iva": "10002290152",
+           "codice_fiscale": "10002290152", "status": "active"}
+    args = dict(external_allowed=True, cache=store, screening=Screen(), http_get=http,
+                ins_pdf_index={"piva:10002290152": {"status": "valid"}})
+    p1 = engine.profile(row, "INS", **args)
+    first = calls["n"]
+    p2 = engine.profile(row, "INS", **args)
+    assert calls["n"] == first   # served from the JSON-backed cache: no refetch
+    assert p2.identity["registered_name"].value == p1.identity["registered_name"].value
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1583,13 +1799,13 @@ Create `tests/fixtures/gleif_record.json`:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python -m pytest tests/test_enrich_contracts.py -q`
-Expected: PASS (3 passed).
+Expected: PASS (4 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add tests/test_enrich_contracts.py tests/fixtures/
-git commit -m "test(enrich): pin provider request shapes + cassette replays"
+git commit -m "test(enrich): pin request shapes, cassettes, real-store cache round-trip"
 ```
 
 ---
@@ -1614,9 +1830,12 @@ pytestmark = pytest.mark.skipif(os.environ.get("ENRICH_LIVE") != "1",
 def test_vies_live_known_valid():
     from enrich.providers.vies import vies_lookup
     from enrich.models import CompanyInput
-    inp = CompanyInput("INS", "1", "GOOGLE IRELAND", "google", "IE", None, None, None,
-                       None, "valid", False)
-    inp = inp.__class__(**{**vars(inp), "vat": None})  # IE example handled separately; smoke GLEIF below
+    from enrich.providers.base import default_http_get
+    # A known-valid EU VAT (verified live during research): GOOGLE IRELAND, IE 6388047V.
+    inp = CompanyInput("INS", "1", "GOOGLE IRELAND LIMITED", "googleireland", "IE", None, None, None,
+                       "6388047V", "valid", False)
+    r = vies_lookup(inp, http_get=default_http_get)
+    assert r.status in ("ok", "invalid", "unavailable")   # network-dependent; must not crash
 
 def test_gleif_live_known_entity():
     from enrich.providers.gleif import gleif_lookup
@@ -1675,7 +1894,9 @@ def main(n):
     import iscc, redcert
     from enrich.adapter import from_sinetti_record
     from enrich.matching import score
-    rows = ([(r, "ISCC") for r in iscc._all_valid_certs()][: n // 2]
+    # Real loaders (verified): iscc._all_scheme_certs() returns {scheme: [compliance-merged certs]};
+    # redcert.load_redcert_certs() returns the REDcert rows. (There is no iscc._all_valid_certs.)
+    rows = ([(r, "ISCC") for r in iscc._all_scheme_certs().get("ISCC", [])][: n // 2]
             + [(r, "REDcert") for r in redcert.load_redcert_certs()][: n // 2])
     hits = abstain = 0
     for row, scheme in rows:
@@ -1703,7 +1924,7 @@ if __name__ == "__main__":
     main(int(sys.argv[1]) if len(sys.argv) > 1 else 150)
 ```
 
-*(Note: `iscc._all_valid_certs` / `redcert.load_redcert_certs` are the existing loaders — confirm the exact loader names when wiring; this script imports `enrich.adapter`/`enrich.matching`, so run it after Tasks 1, 3, 4 exist, OR inline a minimal name/country extraction to run it truly first. Either is fine — the spike is exploratory.)*
+*(Note: this script imports `enrich.adapter`/`enrich.matching`, so run it after Tasks 1, 3, 4 exist, OR inline a minimal name/country extraction to run it truly first. Either is fine — the spike is exploratory and throwaway.)*
 
 - [ ] **Step 2: Run it and record the result**
 
@@ -1719,6 +1940,8 @@ Record the printed hit-rate in a one-paragraph note appended to the spec's §11 
 
 ## Self-Review (completed by the plan author)
 
-- **Spec coverage:** VIES (T7) · GLEIF identity (T8) · fraud flags (T5) · adapter incl. INS PDF-join + ISCC address + anonymised guard (T4) · reconciliation + 4-state verdict (T9) · status-aware cache + Snowflake mirror + audit history (T6) · capability gate (T9/T10) · UI in the real verifier (T10) · rate-limit/timeout (config T2 + provider try/except) · tests incl. contract/cassette/round-trip (T9/T11) · GLEIF spike + decision gate (Phase 0). Ownership is correctly **out** (v1.1).
-- **Placeholder scan:** every code/test step carries real code; no TBD/TODO.
-- **Type consistency:** `CompanyInput`, `Field`, `ProviderResult`, `Verdict`, `NameMatch`, `CompanyProfile` signatures match across T1→T10; `from_sinetti_record(row, scheme, *, ins_pdf_index=)`, `vies_lookup(inp, *, http_get=)`, `gleif_lookup(inp, *, http_get=, abstain_threshold=)`, `profile(row, scheme, *, external_allowed=, cache=, screening=, http_get=, ins_pdf_index=)` are used identically everywhere.
+- **Spec coverage:** VIES (T7) · GLEIF identity (T8) · fraud flags + ISCC-only honesty (T5) · adapter incl. INS PDF-join (digit-stripped keys) + ISCC compliance-merged status + anonymised/foreign-VAT guards (T4) · name-only reconciliation + source-disagreement + 4-state verdict (T9) · status-aware cache + Snowflake mirror + audit history (T6) · capability gate (T9/T10) · UI in the real verifier with most-recent-cert selection (T10) · §10 retry + per-session cap (T7 `base.with_policy`) + timeouts (T2) · tests incl. contract/cassette/real-store cache round-trip/retry/cap (T7/T9/T11) · GLEIF spike + decision gate (Phase 0). Ownership and GLEIF RA-code→name resolution are correctly **out** (v1.1).
+- **Verified against the live codebase (11-agent review):** all 18 load-bearing Sinetti symbols confirmed; the 3 issues found (`iscc._all_valid_certs` non-existent, INS index keys not digit-stripped, Snowflake note over-promising) are fixed above; ISCC loader corrected to `iscc._all_scheme_certs()`.
+- **Post-review hardening applied:** name-only reconciliation (was self-agreeing on the cert's own geo and masking the core fraud signal); reconciliation thresholds moved to `config` (decoupled from the spike-tuned `ABSTAIN_THRESHOLD`); evidence-based `insufficient_data` reasons (no false "no confirmation" when VIES confirmed); robust cache rehydration (malformed row → miss); GLEIF `None`-field guards; `reasons_json`→`reasons` decode; retry/cap implemented (not just declared); cache-consumption proven by HTTP-call counting.
+- **Placeholder scan:** every code/test step carries real code; the only deliberately-exploratory item is the throwaway Phase 0 spike.
+- **Type consistency:** `CompanyInput`, `Field`, `ProviderResult`, `Verdict`, `NameMatch`, `CompanyProfile` signatures match across T1→T10; `from_sinetti_record(row, scheme, *, ins_pdf_index=)`, `vies_lookup(inp, *, http_get=)`, `gleif_lookup(inp, *, http_get=, abstain_threshold=)`, `profile(row, scheme, *, external_allowed=, cache=, screening=, http_get=, ins_pdf_index=)`, `matching.name_similarity(a, b)`, `base.with_policy(http_get)`, `engine._sources_disagree(vies, gleif)`, and `config.NAME_MATCH_THRESHOLD`/`NAME_PARTIAL_THRESHOLD` are used identically everywhere.
