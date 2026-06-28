@@ -340,6 +340,15 @@ discovery path** + `matching.score()` (throttled per §10), (3) reports **hit-ra
 (e.g. **40% [illustrative]**), the fuzzy GLEIF tier ships as **clearly-labelled best-effort** (no
 ownership, reduced UI) rather than as a headline feature. The spike also fixes the `abstain_threshold`.
 
+> **Spike result (run 2026-06-28, live GLEIF, 0 HTTP errors):** confident-match (name-similarity ≥ 0.85)
+> on ISCC + REDcert holders was **~25% at N=80** (43% on a noisier N=30). **Below the 40% gate → GLEIF
+> ships as best-effort for ISCC/REDcert.** Decision: keep the engine and `ABSTAIN_THRESHOLD = 0.85`
+> (a conservative bar avoids wrong identities in a due-diligence tool); the UI labels GLEIF identity as
+> best-effort; for non-INS holders the verdict will commonly be ⚪ `insufficient_data` — which is the
+> honest outcome the four-state verdict was designed for, **not** a defect. INS/VIES remains the
+> high-confidence path. **No build changes required** — the architecture already absorbs low GLEIF
+> coverage by treating a no-match as neutral.
+
 ## 12. Testing strategy
 
 Pure engine → deterministic, no live network in CI:
